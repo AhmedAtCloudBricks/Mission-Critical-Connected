@@ -1,0 +1,85 @@
+name: '[${{ parameters.environment }}] $(BuildDefinitionName).$(DayOfYear)$(Rev:.r)'
+
+trigger: none
+
+pr: none
+
+parameters:
+- name: environment
+  displayName: 'Environment (Subscriptions)'
+  type: string
+  default: 'e2e'
+  values:
+  - e2e
+  - int
+  - prod
+
+pool:
+  vmImage: 'ubuntu-20.04'
+
+variables:
+- name:  'environment' # set the environment name as variable
+  value: '${{ parameters.environment }}'
+- name:  'workingDirectory'       # Terraform working directory
+  value: 'src/infra/build-agents'
+- name:  'azureServiceConnection' # environment specific service connection
+  value: 'alwayson-${{ parameters.environment }}-serviceconnection'
+
+- template: config/configuration.yaml # contains version numbers and global configuration settings
+- template: config/variables-values-${{ parameters.environment }}.yaml # contains environment-specific values (non-secret)
+- group: '${{ variables.environment }}-env-vg' # contains environment-specific values (secrets which cannot be stored in the config file)
+
+stages:
+
+- stage: deployinfrastructure
+  displayName: 'Deploy Build Agent Infrastructure' # Deploy Azure Infrastructure
+  jobs:
+  - job: deploybicepbuildagent
+    displayName: 'Deploy Bicep'
+    steps:
+    - checkout: self # checkout github repository
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Build Agent Bicep template'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          $rgName = "$(prefix)-buildinfra-rg"
+
+          $locations = '$(stampLocations)' | ConvertFrom-Json -NoEnumerate # get the stamp locations and use the first one to create the resource group there. The region does not really matter.
+          $location = $locations[0]
+
+          echo "*** Check if Resource Group $rgName exists"
+          $checkRg = az group exists --name $rgName | ConvertFrom-Json
+          if (!$checkRg) {
+            Write-Warning "*** WARN! Resource Group $rgName does not exist. Creating..."
+
+            az group create --name $rgName --location $location
+
+            if ($LastExitCode -eq 1) {
+              Write-Error "*** Error - could not create resource group"
+            }
+          }
+          else
+          {
+            echo "*** Ok"
+          }
+
+          $deploymentName = "buildinfra-deploy-$(Build.BuildId)"
+
+          echo "*** Running bicep deployment $deploymentName"
+          az deployment group create -g $rgName `
+                                     --template-file "$(workingDirectory)/main.bicep" `
+                                      -n $deploymentName `
+                                      -p prefix=$(prefix) `
+                                      -p suffix=buildinfra `
+                                      -p environment=$(environment) `
+                                      -p location=$location `
+                                      -p vmssAdminPassword=$(buildAgentAdminPassword)
+
+          if ($LastExitCode -eq 1) {
+            Write-Error "*** Error on bicep template deployment"
+          }
